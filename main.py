@@ -6,7 +6,7 @@ import asyncio
 import requests
 from fastapi import FastAPI, Request
 from sqlalchemy import create_engine, Column, Integer, String
-from sqlalchemy.orm import declarative_base, sessionmaker
+from sqlalchemy.orm import declarative_base, sessionmaker # Updated for SQLAlchemy 2.0
 from dotenv import load_dotenv
 from aiogram import Bot, Dispatcher, types, F
 from aiogram.types import InlineKeyboardMarkup, InlineKeyboardButton, ReplyKeyboardMarkup, KeyboardButton
@@ -35,6 +35,9 @@ class User(Base):
     username = Column(String)
     balance = Column(Integer, default=3)
 
+# --- THE FIX ---
+# Uncomment the next line ONLY for the first deploy to reset the table, then comment it out again.
+# Base.metadata.drop_all(bind=engine) 
 Base.metadata.create_all(bind=engine)
 
 # --- Initialization ---
@@ -140,7 +143,7 @@ async def process_buy(callback: types.CallbackQuery):
     if url:
         await callback.message.answer(f"🔗 [Click here to pay ${price}]({url})", parse_mode="Markdown")
     else:
-        await callback.answer("Error creating invoice. Try again later.", show_alert=True)
+        await callback.answer("Error creating invoice. Check your Cryptomus keys.", show_alert=True)
     await callback.answer()
 
 @dp.message(F.text == "🚀 Start Using")
@@ -155,7 +158,7 @@ async def handle_prompt(message: types.Message):
     db = SessionLocal()
     user = db.query(User).filter(User.user_id == uid).first()
     
-    if user.balance <= 0:
+    if not user or user.balance <= 0:
         await message.answer("❌ Out of credits. Please refill in your profile!", reply_markup=refill_kb())
         db.close()
         return
@@ -193,4 +196,5 @@ async def startup_event():
 
 if __name__ == "__main__":
     import uvicorn
-    uvicorn.run(app, host="0.0.0.0", port=int(os.getenv("PORT", 8000)))
+    port = int(os.getenv("PORT", 8000))
+    uvicorn.run(app, host="0.0.0.0", port=port)
