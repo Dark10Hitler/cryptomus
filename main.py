@@ -38,13 +38,13 @@ class User(Base):
 # Создаем таблицы
 Base.metadata.create_all(bind=engine)
 
-# АВТО-ИСПРАВЛЕНИЕ: Добавляем колонку username, если её нет в старой базе
+# АВТО-ИСПРАВЛЕНИЕ: Добавляем колонку username, если её нет
 with engine.connect() as conn:
     try:
         conn.execute(text("ALTER TABLE users ADD COLUMN IF NOT EXISTS username VARCHAR;"))
         conn.commit()
-    except Exception as e:
-        print(f"Migration notice: {e}")
+    except Exception:
+        pass
 
 # --- Инициализация ---
 app = FastAPI()
@@ -116,6 +116,10 @@ async def cmd_start(message: types.Message):
         user = User(user_id=uid, username=message.from_user.username, balance=3)
         db.add(user)
         db.commit()
+    else:
+        # Обновляем юзернейм, если он изменился
+        user.username = message.from_user.username
+        db.commit()
     db.close()
     await message.answer(f"Hi {message.from_user.first_name}! 🚀\nI'm your AI Scriptwriter. You have 3 free credits.", reply_markup=main_kb())
 
@@ -124,7 +128,8 @@ async def cmd_profile(message: types.Message):
     db = SessionLocal()
     user = db.query(User).filter(User.user_id == str(message.from_user.id)).first()
     db.close()
-    await message.answer(f"👤 @{user.username}\n💰 Balance: {user.balance} scripts", reply_markup=profile_kb())
+    if user:
+        await message.answer(f"👤 @{user.username or 'User'}\n💰 Balance: {user.balance} scripts", reply_markup=profile_kb())
 
 @dp.callback_query(F.data == "refill_menu")
 async def refill_menu(callback: types.CallbackQuery):
@@ -151,7 +156,7 @@ async def handle_request(message: types.Message):
     db = SessionLocal()
     user = db.query(User).filter(User.user_id == str(message.from_user.id)).first()
     
-    if user.balance <= 0:
+    if not user or user.balance <= 0:
         await message.answer("❌ No credits left!", reply_markup=profile_kb())
         db.close()
         return
@@ -169,19 +174,23 @@ async def handle_request(message: types.Message):
 async def webhook(request: Request):
     data = await request.json()
     if data.get('status') in ['paid', 'completed']:
-        u_id, count, _ = data.get('order_id').split('_')
-        db = SessionLocal()
-        user = db.query(User).filter(User.user_id = u_id).first()
-        if user:
-            user.balance += int(count)
-            db.commit()
-            await bot.send_message(u_id, f"✅ Balance updated: +{count}")
-        db.close()
+        order_id = data.get('order_id')
+        if order_id:
+            u_id, count, _ = order_id.split('_')
+            db = SessionLocal()
+            # ВОТ ЗДЕСЬ БЫЛА ОШИБКА, ТЕПЕРЬ ТУТ "=="
+            user = db.query(User).filter(User.user_id == u_id).first()
+            if user:
+                user.balance += int(count)
+                db.commit()
+                try:
+                    await bot.send_message(u_id, f"✅ Balance updated: +{count}")
+                except: pass
+            db.close()
     return {"status": "ok"}
 
 @app.on_event("startup")
 async def on_startup():
-    # Удаляем вебхуки перед запуском, чтобы избежать Conflict
     await bot.delete_webhook(drop_pending_updates=True)
     asyncio.create_task(dp.start_polling(bot))
 
