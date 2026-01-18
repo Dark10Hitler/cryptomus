@@ -5,7 +5,7 @@ import base64
 import asyncio
 import requests
 from fastapi import FastAPI, Request
-from sqlalchemy import create_engine, Column, Integer, String
+from sqlalchemy import create_engine, Column, Integer, String, text
 from sqlalchemy.orm import declarative_base, sessionmaker
 from dotenv import load_dotenv
 from aiogram import Bot, Dispatcher, types, F
@@ -13,7 +13,7 @@ from aiogram.types import InlineKeyboardMarkup, InlineKeyboardButton, ReplyKeybo
 
 load_dotenv()
 
-# --- Configuration ---
+# --- Конфигурация ---
 DATABASE_URL = os.getenv("DATABASE_URL")
 if DATABASE_URL and DATABASE_URL.startswith("postgres://"):
     DATABASE_URL = DATABASE_URL.replace("postgres://", "postgresql://", 1)
@@ -24,7 +24,7 @@ CRYPTOMUS_KEY = os.getenv("CRYPTOMUS_API_KEY")
 CRYPTOMUS_MERCHANT = os.getenv("CRYPTOMUS_MERCHANT_ID")
 RENDER_URL = os.getenv("RENDER_EXTERNAL_URL")
 
-# --- Database ---
+# --- База данных ---
 engine = create_engine(DATABASE_URL, pool_pre_ping=True)
 SessionLocal = sessionmaker(autocommit=False, autoflush=False, bind=engine)
 Base = declarative_base()
@@ -35,16 +35,23 @@ class User(Base):
     username = Column(String)
     balance = Column(Integer, default=3)
 
-# IMPORTANT: If you see "UndefinedColumn", uncomment the next line for ONE deploy, then comment it back.
-# Base.metadata.drop_all(bind=engine) 
+# Создаем таблицы
 Base.metadata.create_all(bind=engine)
 
-# --- Initialization ---
+# АВТО-ИСПРАВЛЕНИЕ: Добавляем колонку username, если её нет в старой базе
+with engine.connect() as conn:
+    try:
+        conn.execute(text("ALTER TABLE users ADD COLUMN IF NOT EXISTS username VARCHAR;"))
+        conn.commit()
+    except Exception as e:
+        print(f"Migration notice: {e}")
+
+# --- Инициализация ---
 app = FastAPI()
 bot = Bot(token=TG_TOKEN)
 dp = Dispatcher()
 
-# --- Keyboards ---
+# --- Клавиатуры ---
 def main_kb():
     return ReplyKeyboardMarkup(keyboard=[
         [KeyboardButton(text="👤 My Profile")],
@@ -63,7 +70,7 @@ def pricing_kb():
         [InlineKeyboardButton(text="🚀 100 Scripts — $10", callback_data="buy_10_100")]
     ])
 
-# --- Logic: Payments & AI ---
+# --- Логика Cryptomus ---
 def create_cryptomus_invoice(user_id, amount, count):
     order_id = f"{user_id}_{count}_{os.urandom(2).hex()}"
     payload = {
@@ -73,8 +80,8 @@ def create_cryptomus_invoice(user_id, amount, count):
         "url_callback": f"{RENDER_URL}/cryptomus_webhook"
     }
     data_json = json.dumps(payload)
-    # Cryptomus Signature: md5(base64(json) + api_key)
-    sign = hashlib.md5((base64.b64encode(data_json.encode()).decode() + CRYPTOMUS_KEY).encode()).hexdigest()
+    data_base64 = base64.b64encode(data_json.encode()).decode()
+    sign = hashlib.md5((data_base64 + CRYPTOMUS_KEY).encode()).hexdigest()
     
     headers = {"merchant": CRYPTOMUS_MERCHANT, "sign": sign, "Content-Type": "application/json"}
     try:
@@ -83,12 +90,9 @@ def create_cryptomus_invoice(user_id, amount, count):
     except:
         return None
 
+# --- Логика AI ---
 async def fetch_ai_script(prompt):
-    headers = {
-        "Authorization": f"Bearer {OPENROUTER_KEY}",
-        "Content-Type": "application/json",
-        "HTTP-Referer": RENDER_URL,
-    }
+    headers = {"Authorization": f"Bearer {OPENROUTER_KEY}", "Content-Type": "application/json"}
     payload = {
         "model": "openai/gpt-5-nano",
         "messages": [
@@ -102,7 +106,7 @@ async def fetch_ai_script(prompt):
     except:
         return "⚠️ AI service is busy. Please try again later."
 
-# --- Handlers ---
+# --- Обработчики бота ---
 @dp.message(F.text == "/start")
 async def cmd_start(message: types.Message):
     uid = str(message.from_user.id)
@@ -113,24 +117,18 @@ async def cmd_start(message: types.Message):
         db.add(user)
         db.commit()
     db.close()
-    await message.answer(
-        f"Hi {message.from_user.first_name}! 🚀\n\nI'm your GPT-5 powered scriptwriter. "
-        f"You have **3 free credits** left.", reply_markup=main_kb(), parse_mode="Markdown")
+    await message.answer(f"Hi {message.from_user.first_name}! 🚀\nI'm your AI Scriptwriter. You have 3 free credits.", reply_markup=main_kb())
 
 @dp.message(F.text == "👤 My Profile")
 async def cmd_profile(message: types.Message):
-    uid = str(message.from_user.id)
     db = SessionLocal()
-    user = db.query(User).filter(User.user_id == uid).first()
-    text = (f"🆔 **Your ID:** `{user.user_id}`\n"
-            f"👤 **Username:** @{user.username or 'N/A'}\n"
-            f"💰 **Balance:** {user.balance} scripts")
+    user = db.query(User).filter(User.user_id == str(message.from_user.id)).first()
     db.close()
-    await message.answer(text, reply_markup=profile_kb(), parse_mode="Markdown")
+    await message.answer(f"👤 @{user.username}\n💰 Balance: {user.balance} scripts", reply_markup=profile_kb())
 
 @dp.callback_query(F.data == "refill_menu")
 async def refill_menu(callback: types.CallbackQuery):
-    await callback.message.answer("Select a package to add credits:", reply_markup=pricing_kb())
+    await callback.message.answer("Select a package:", reply_markup=pricing_kb())
     await callback.answer()
 
 @dp.callback_query(F.data.startswith("buy_"))
@@ -138,13 +136,13 @@ async def process_buy(callback: types.CallbackQuery):
     _, price, count = callback.data.split("_")
     url = create_cryptomus_invoice(callback.from_user.id, price, count)
     if url:
-        await callback.message.answer(f"🔗 [Pay ${price} with Crypto]({url})", parse_mode="Markdown")
+        await callback.message.answer(f"🔗 [Pay ${price} via Cryptomus]({url})", parse_mode="Markdown")
     else:
-        await callback.answer("Payment error. Try again later.")
+        await callback.answer("Payment error!")
 
 @dp.message(F.text == "🚀 Start Using")
 async def cmd_use(message: types.Message):
-    await message.answer("Send me your video topic (e.g., 'Fitness tips for beginners').")
+    await message.answer("What is the video topic?")
 
 @dp.message()
 async def handle_request(message: types.Message):
@@ -154,36 +152,37 @@ async def handle_request(message: types.Message):
     user = db.query(User).filter(User.user_id == str(message.from_user.id)).first()
     
     if user.balance <= 0:
-        await message.answer("❌ You have 0 credits. Please refill in your profile.", reply_markup=profile_kb())
+        await message.answer("❌ No credits left!", reply_markup=profile_kb())
         db.close()
         return
 
-    status_msg = await message.answer("🤖 GPT-5 is writing your script...")
+    status = await message.answer("🤖 Writing...")
     script = await fetch_ai_script(message.text)
     
     user.balance -= 1
     db.commit()
     db.close()
-    
-    await status_msg.edit_text(f"{script}\n\n📉 Credits left: {user.balance}")
+    await status.edit_text(f"{script}\n\n📉 Credits: {user.balance}")
 
-# --- Webhook ---
+# --- Webhook & Startup ---
 @app.post("/cryptomus_webhook")
 async def webhook(request: Request):
     data = await request.json()
     if data.get('status') in ['paid', 'completed']:
         u_id, count, _ = data.get('order_id').split('_')
         db = SessionLocal()
-        user = db.query(User).filter(User.user_id == u_id).first()
+        user = db.query(User).filter(User.user_id = u_id).first()
         if user:
             user.balance += int(count)
             db.commit()
-            await bot.send_message(u_id, f"✅ Payment confirmed! +{count} credits added.")
+            await bot.send_message(u_id, f"✅ Balance updated: +{count}")
         db.close()
     return {"status": "ok"}
 
 @app.on_event("startup")
 async def on_startup():
+    # Удаляем вебхуки перед запуском, чтобы избежать Conflict
+    await bot.delete_webhook(drop_pending_updates=True)
     asyncio.create_task(dp.start_polling(bot))
 
 if __name__ == "__main__":
