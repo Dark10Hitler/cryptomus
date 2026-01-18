@@ -11,7 +11,7 @@ from aiogram import Bot, Dispatcher, types, F
 from aiogram.types import InlineKeyboardMarkup, InlineKeyboardButton
 from aiogram.exceptions import TelegramBadRequest
 
-# --- 0. Настройка Логирования (Чтобы видеть ошибки кнопок) ---
+# --- 0. Настройка Логирования ---
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
 
@@ -35,7 +35,7 @@ class User(Base):
     user_id = Column(String, primary_key=True)
     username = Column(String)
     balance = Column(Integer, default=10)
-    last_bonus = Column(DateTime, default=datetime.utcnow() - timedelta(days=1))
+    last_bonus = Column(DateTime, nullable=True) # Разрешаем NULL
 
 # Создание таблиц и миграция
 Base.metadata.create_all(bind=engine)
@@ -90,8 +90,10 @@ async def cmd_start(message: types.Message):
     db = SessionLocal()
     try:
         user = db.query(User).filter(User.user_id == str(message.from_user.id)).first()
+        # Если юзера нет - создаем. Ставим last_bonus "вчера", чтобы можно было сразу забрать бонус
         if not user:
-            user = User(user_id=str(message.from_user.id), username=message.from_user.username, balance=10)
+            yesterday = datetime.utcnow() - timedelta(days=1)
+            user = User(user_id=str(message.from_user.id), username=message.from_user.username, balance=10, last_bonus=yesterday)
             db.add(user)
             db.commit()
     except Exception as e:
@@ -107,7 +109,7 @@ async def cmd_start(message: types.Message):
     )
     await message.answer(welcome_text, reply_markup=get_main_menu(), parse_mode="Markdown")
 
-# --- ОБРАБОТЧИК ПРОФИЛЯ ---
+# --- ОБРАБОТЧИК ПРОФИЛЯ (ИСПРАВЛЕНО) ---
 @dp.callback_query(F.data == "view_profile")
 async def callback_profile(callback: types.CallbackQuery):
     logger.info(f"Button pressed: view_profile by {callback.from_user.id}")
@@ -115,17 +117,23 @@ async def callback_profile(callback: types.CallbackQuery):
     db = SessionLocal()
     user = db.query(User).filter(User.user_id == str(callback.from_user.id)).first()
     
-    # Расчет таймера
     now = datetime.utcnow()
-    next_bonus_time = user.last_bonus + timedelta(days=1)
-    wait_time = next_bonus_time - now
     
-    if wait_time.total_seconds() > 0:
-        hours, remainder = divmod(int(wait_time.total_seconds()), 3600)
-        minutes, _ = divmod(remainder, 60)
-        timer_text = f"⏳ Next bonus in: **{hours}h {minutes}m**"
-    else:
+    # --- ФИКС ОШИБКИ ЗДЕСЬ ---
+    # Если last_bonus равен None (у старых юзеров), считаем, что бонус доступен
+    if user.last_bonus is None:
         timer_text = "🎁 **Daily bonus available!**"
+    else:
+        next_bonus_time = user.last_bonus + timedelta(days=1)
+        wait_time = next_bonus_time - now
+        
+        if wait_time.total_seconds() > 0:
+            hours, remainder = divmod(int(wait_time.total_seconds()), 3600)
+            minutes, _ = divmod(remainder, 60)
+            timer_text = f"⏳ Next bonus in: **{hours}h {minutes}m**"
+        else:
+            timer_text = "🎁 **Daily bonus available!**"
+    # -------------------------
 
     text_content = (
         "📋 **YOUR PROFILE**\n"
@@ -141,12 +149,11 @@ async def callback_profile(callback: types.CallbackQuery):
     try:
         await callback.message.edit_text(text_content, reply_markup=get_profile_menu(), parse_mode="Markdown")
     except TelegramBadRequest:
-        # Игнорируем ошибку, если текст не изменился (пользователь нажал кнопку дважды)
-        await callback.answer()
+        pass # Игнорируем, если текст не изменился
     
-    await callback.answer() # Важно! Убирает часики
+    await callback.answer()
 
-# --- ОБРАБОТЧИК БОНУСА ---
+# --- ОБРАБОТЧИК БОНУСА (ИСПРАВЛЕНО) ---
 @dp.callback_query(F.data == "get_bonus")
 async def callback_bonus(callback: types.CallbackQuery):
     logger.info(f"Button pressed: get_bonus by {callback.from_user.id}")
@@ -155,14 +162,16 @@ async def callback_bonus(callback: types.CallbackQuery):
     user = db.query(User).filter(User.user_id == str(callback.from_user.id)).first()
     
     now = datetime.utcnow()
-    if now > user.last_bonus + timedelta(days=1):
+    
+    # --- ФИКС ОШИБКИ ЗДЕСЬ ---
+    # Разрешаем бонус, если last_bonus пустой (None) ИЛИ прошло время
+    if user.last_bonus is None or now > user.last_bonus + timedelta(days=1):
         user.balance += 5
         user.last_bonus = now
         db.commit()
         await callback.answer("✅ +5 credits added!", show_alert=True)
-        # Обновляем текст профиля сразу
         db.close()
-        # Вызываем функцию профиля, чтобы обновить текст
+        # Обновляем вид профиля
         await callback_profile(callback) 
     else:
         db.close()
@@ -218,15 +227,9 @@ async def handle_ai_request(message: types.Message):
 # --- 7. Запуск (Polling) ---
 @app.on_event("startup")
 async def on_startup():
-    # Удаляем старые вебхуки, чтобы polling работал корректно
     await bot.delete_webhook(drop_pending_updates=True)
-    # Явно указываем allowed_updates, чтобы кнопки работали
-    asyncio.create_task(
-        dp.start_polling(
-            bot, 
-            allowed_updates=["message", "callback_query"]
-        )
-    )
+    # Явно указываем allowed_updates
+    asyncio.create_task(dp.start_polling(bot, allowed_updates=["message", "callback_query"]))
 
 @app.get("/")
 async def root():
