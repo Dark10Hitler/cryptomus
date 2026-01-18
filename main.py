@@ -35,9 +35,8 @@ class User(Base):
     user_id = Column(String, primary_key=True)
     username = Column(String)
     balance = Column(Integer, default=10)
-    last_bonus = Column(DateTime, nullable=True) # Разрешаем NULL
+    last_bonus = Column(DateTime, nullable=True)
 
-# Создание таблиц и миграция
 Base.metadata.create_all(bind=engine)
 with engine.connect() as conn:
     try:
@@ -45,12 +44,12 @@ with engine.connect() as conn:
         conn.commit()
     except Exception: pass
 
-# --- 3. Инициализация Бота ---
+# --- 3. Инициализация ---
 app = FastAPI()
 bot = Bot(token=TG_TOKEN)
 dp = Dispatcher()
 
-# --- 4. Меню (Клавиатуры) ---
+# --- 4. Меню ---
 def get_main_menu():
     buttons = [
         [InlineKeyboardButton(text="🚀 Create New Script", callback_data="start_ai")],
@@ -82,62 +81,42 @@ async def fetch_ai_script(prompt):
         logger.error(f"AI Error: {e}")
         return "⚠️ AI service is currently unavailable. Please try again."
 
-# --- 6. Обработчики (Handlers) ---
-
+# --- 6. Обработчики ---
 @dp.message(F.text == "/start")
 async def cmd_start(message: types.Message):
-    logger.info(f"Command /start from {message.from_user.id}")
     db = SessionLocal()
     try:
         user = db.query(User).filter(User.user_id == str(message.from_user.id)).first()
-        # Если юзера нет - создаем. Ставим last_bonus "вчера", чтобы можно было сразу забрать бонус
         if not user:
             yesterday = datetime.utcnow() - timedelta(days=1)
             user = User(user_id=str(message.from_user.id), username=message.from_user.username, balance=10, last_bonus=yesterday)
             db.add(user)
             db.commit()
-    except Exception as e:
-        logger.error(f"DB Error on start: {e}")
-    finally:
-        db.close()
+    except Exception: pass
+    finally: db.close()
     
-    welcome_text = (
-        f"👋 **Hello, {message.from_user.first_name}!**\n\n"
-        "I am your AI Scriptwriter.\n"
-        "Sending a topic will cost **1 credit**.\n\n"
-        "👇 Choose an option:"
-    )
-    await message.answer(welcome_text, reply_markup=get_main_menu(), parse_mode="Markdown")
+    await message.answer("👋 **Hello!** I am your AI Scriptwriter.\n\n👇 Choose an option:", reply_markup=get_main_menu(), parse_mode="Markdown")
 
-# --- ОБРАБОТЧИК ПРОФИЛЯ (ИСПРАВЛЕНО) ---
 @dp.callback_query(F.data == "view_profile")
 async def callback_profile(callback: types.CallbackQuery):
-    logger.info(f"Button pressed: view_profile by {callback.from_user.id}")
-    
     db = SessionLocal()
     user = db.query(User).filter(User.user_id == str(callback.from_user.id)).first()
     
     now = datetime.utcnow()
-    
-    # --- ФИКС ОШИБКИ ЗДЕСЬ ---
-    # Если last_bonus равен None (у старых юзеров), считаем, что бонус доступен
     if user.last_bonus is None:
         timer_text = "🎁 **Daily bonus available!**"
     else:
         next_bonus_time = user.last_bonus + timedelta(days=1)
         wait_time = next_bonus_time - now
-        
         if wait_time.total_seconds() > 0:
             hours, remainder = divmod(int(wait_time.total_seconds()), 3600)
             minutes, _ = divmod(remainder, 60)
             timer_text = f"⏳ Next bonus in: **{hours}h {minutes}m**"
         else:
             timer_text = "🎁 **Daily bonus available!**"
-    # -------------------------
 
     text_content = (
-        "📋 **YOUR PROFILE**\n"
-        "──────────────────\n"
+        "📋 **YOUR PROFILE**\n──────────────────\n"
         f"👤 **User:** @{user.username or 'NoName'}\n"
         f"🆔 **ID:** `{user.user_id}`\n"
         f"💰 **Balance:** `{user.balance}` scripts\n"
@@ -145,96 +124,75 @@ async def callback_profile(callback: types.CallbackQuery):
         f"{timer_text}"
     )
     db.close()
-    
-    try:
-        await callback.message.edit_text(text_content, reply_markup=get_profile_menu(), parse_mode="Markdown")
-    except TelegramBadRequest:
-        pass # Игнорируем, если текст не изменился
-    
+    try: await callback.message.edit_text(text_content, reply_markup=get_profile_menu(), parse_mode="Markdown")
+    except TelegramBadRequest: pass
     await callback.answer()
 
-# --- ОБРАБОТЧИК БОНУСА (ИСПРАВЛЕНО) ---
 @dp.callback_query(F.data == "get_bonus")
 async def callback_bonus(callback: types.CallbackQuery):
-    logger.info(f"Button pressed: get_bonus by {callback.from_user.id}")
-    
     db = SessionLocal()
     user = db.query(User).filter(User.user_id == str(callback.from_user.id)).first()
-    
     now = datetime.utcnow()
     
-    # --- ФИКС ОШИБКИ ЗДЕСЬ ---
-    # Разрешаем бонус, если last_bonus пустой (None) ИЛИ прошло время
     if user.last_bonus is None or now > user.last_bonus + timedelta(days=1):
         user.balance += 5
         user.last_bonus = now
         db.commit()
         await callback.answer("✅ +5 credits added!", show_alert=True)
         db.close()
-        # Обновляем вид профиля
         await callback_profile(callback) 
     else:
         db.close()
         await callback.answer("❌ Too early! Check the timer.", show_alert=True)
 
-# --- ОБРАБОТЧИК СОЗДАНИЯ СКРИПТА ---
 @dp.callback_query(F.data == "start_ai")
 async def callback_ai_prompt(callback: types.CallbackQuery):
-    logger.info("Button pressed: start_ai")
-    await callback.message.answer("📝 **Write your video topic below:**\n(e.g., 'Fitness tips for beginners')")
+    await callback.message.answer("📝 **Write your video topic below:**")
     await callback.answer()
 
-# --- КНОПКА НАЗАД ---
 @dp.callback_query(F.data == "back_to_main")
 async def callback_main(callback: types.CallbackQuery):
-    logger.info("Button pressed: back_to_main")
-    try:
-        await callback.message.edit_text("🏠 **Main Menu**", reply_markup=get_main_menu(), parse_mode="Markdown")
-    except TelegramBadRequest:
-        pass
+    try: await callback.message.edit_text("🏠 **Main Menu**", reply_markup=get_main_menu(), parse_mode="Markdown")
+    except TelegramBadRequest: pass
     await callback.answer()
 
-# --- ОБРАБОТЧИК ТЕКСТА (AI) ---
 @dp.message()
 async def handle_ai_request(message: types.Message):
     if not message.text or message.text.startswith("/"): return
-    
-    logger.info(f"Received text prompt from {message.from_user.id}")
-
     db = SessionLocal()
     user = db.query(User).filter(User.user_id == str(message.from_user.id)).first()
-    
     if not user or user.balance <= 0:
-        await message.answer("❌ **Insufficient credits!**\nGo to Profile -> Get Daily Bonus.", reply_markup=get_main_menu())
+        await message.answer("❌ **Insufficient credits!**", reply_markup=get_main_menu())
         db.close()
         return
-
-    wait_msg = await message.answer("🤖 **Generating script...**")
     
+    wait_msg = await message.answer("🤖 **Generating script...**")
     user.balance -= 1
     db.commit()
     rem_balance = user.balance
     db.close()
 
     script = await fetch_ai_script(message.text)
-    
-    final_text = (
-        f"🎬 **RESULT:**\n\n{script}\n\n"
-        f"📉 Credits left: `{rem_balance}`"
-    )
-    await wait_msg.edit_text(final_text, reply_markup=get_main_menu(), parse_mode="Markdown")
+    await wait_msg.edit_text(f"🎬 **RESULT:**\n\n{script}\n\n📉 Credits left: `{rem_balance}`", reply_markup=get_main_menu(), parse_mode="Markdown")
 
-# --- 7. Запуск (Polling) ---
+# --- 7. Запуск (С ИСПРАВЛЕНИЕМ ПОРТА) ---
+async def start_bot_delayed():
+    # Ждем 3 секунды, чтобы FastAPI успел запуститься и привязаться к порту
+    await asyncio.sleep(3)
+    await bot.delete_webhook(drop_pending_updates=True)
+    asyncio.create_task(dp.start_polling(bot, allowed_updates=["message", "callback_query"]))
+
 @app.on_event("startup")
 async def on_startup():
-    await bot.delete_webhook(drop_pending_updates=True)
-    # Явно указываем allowed_updates
-    asyncio.create_task(dp.start_polling(bot, allowed_updates=["message", "callback_query"]))
+    # Запускаем бота отдельно от основного потока
+    asyncio.create_task(start_bot_delayed())
 
 @app.get("/")
 async def root():
-    return {"status": "Bot is operational"}
+    return {"status": "OK", "message": "Bot is running"}
 
 if __name__ == "__main__":
     import uvicorn
-    uvicorn.run(app, host="0.0.0.0", port=int(os.getenv("PORT", 8000)))
+    # ВАЖНО: host должен быть 0.0.0.0
+    port = int(os.getenv("PORT", 10000)) # Render обычно использует 10000
+    uvicorn.run(app, host="0.0.0.0", port=port)
