@@ -22,9 +22,9 @@ TG_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN")
 OPENROUTER_KEY = os.getenv("OPENROUTER_API_KEY")
 CRYPTOMUS_KEY = os.getenv("CRYPTOMUS_API_KEY")
 CRYPTOMUS_MERCHANT = os.getenv("CRYPTOMUS_MERCHANT_ID")
-RENDER_URL = os.getenv("RENDER_EXTERNAL_URL") # e.g., https://cryptomus-4djo.onrender.com
+RENDER_URL = os.getenv("RENDER_EXTERNAL_URL")
 
-# --- Database Setup ---
+# --- Database ---
 engine = create_engine(DATABASE_URL, pool_pre_ping=True)
 SessionLocal = sessionmaker(autocommit=False, autoflush=False, bind=engine)
 Base = declarative_base()
@@ -35,68 +35,46 @@ class User(Base):
     username = Column(String)
     balance = Column(Integer, default=3)
 
-# --- DATABASE FIX: Drop and Recreate to avoid 'username' column error ---
-# NOTE: Run this once, then you can comment out 'drop_all' if you want to keep data.
+# IMPORTANT: If you see "UndefinedColumn", uncomment the next line for ONE deploy, then comment it back.
 # Base.metadata.drop_all(bind=engine) 
 Base.metadata.create_all(bind=engine)
 
-# --- Bot & App Initialization ---
+# --- Initialization ---
 app = FastAPI()
 bot = Bot(token=TG_TOKEN)
 dp = Dispatcher()
 
 # --- Keyboards ---
-def main_menu():
+def main_kb():
     return ReplyKeyboardMarkup(keyboard=[
         [KeyboardButton(text="👤 My Profile")],
         [KeyboardButton(text="🚀 Start Using")]
     ], resize_keyboard=True)
 
-def refill_button():
+def profile_kb():
     return InlineKeyboardMarkup(inline_keyboard=[
         [InlineKeyboardButton(text="💳 Add Credits", callback_data="refill_menu")]
     ])
 
-def pricing_menu():
+def pricing_kb():
     return InlineKeyboardMarkup(inline_keyboard=[
-        [InlineKeyboardButton(text="💎 10 Credits — $2", callback_data="buy_2_10")],
-        [InlineKeyboardButton(text="🔥 30 Credits — $4", callback_data="buy_4_30")],
-        [InlineKeyboardButton(text="🚀 100 Credits — $10", callback_data="buy_10_100")]
+        [InlineKeyboardButton(text="💎 10 Scripts — $2", callback_data="buy_2_10")],
+        [InlineKeyboardButton(text="🔥 30 Scripts — $4", callback_data="buy_4_30")],
+        [InlineKeyboardButton(text="🚀 100 Scripts — $10", callback_data="buy_10_100")]
     ])
 
-# --- Logic: AI Generation ---
-async def call_ai_model(prompt):
-    headers = {
-        "Authorization": f"Bearer {OPENROUTER_KEY}",
-        "Content-Type": "application/json",
-        "HTTP-Referer": RENDER_URL,
-        "X-Title": "Viral Script Bot"
-    }
-    data = {
-        "model": "openai/gpt-5-nano",
-        "messages": [
-            {"role": "system", "content": "You are a professional viral script writer. Provide engaging, high-hook scripts in English."},
-            {"role": "user", "content": prompt}
-        ]
-    }
-    try:
-        response = requests.post("https://openrouter.ai/api/v1/chat/completions", headers=headers, json=data, timeout=60)
-        return response.json()['choices'][0]['message']['content']
-    except Exception as e:
-        return f"AI Service Error: {str(e)}"
-
-# --- Logic: Payments ---
-def create_payment(user_id, amount, credits_count):
-    order_id = f"{user_id}_{credits_count}_{os.urandom(2).hex()}"
+# --- Logic: Payments & AI ---
+def create_cryptomus_invoice(user_id, amount, count):
+    order_id = f"{user_id}_{count}_{os.urandom(2).hex()}"
     payload = {
-        "amount": amount,
+        "amount": str(amount),
         "currency": "USD",
         "order_id": order_id,
         "url_callback": f"{RENDER_URL}/cryptomus_webhook"
     }
     data_json = json.dumps(payload)
-    data_base64 = base64.b64encode(data_json.encode()).decode()
-    sign = hashlib.md5((data_base64 + CRYPTOMUS_KEY).encode()).hexdigest()
+    # Cryptomus Signature: md5(base64(json) + api_key)
+    sign = hashlib.md5((base64.b64encode(data_json.encode()).decode() + CRYPTOMUS_KEY).encode()).hexdigest()
     
     headers = {"merchant": CRYPTOMUS_MERCHANT, "sign": sign, "Content-Type": "application/json"}
     try:
@@ -105,9 +83,28 @@ def create_payment(user_id, amount, credits_count):
     except:
         return None
 
-# --- Bot Handlers ---
+async def fetch_ai_script(prompt):
+    headers = {
+        "Authorization": f"Bearer {OPENROUTER_KEY}",
+        "Content-Type": "application/json",
+        "HTTP-Referer": RENDER_URL,
+    }
+    payload = {
+        "model": "openai/gpt-5-nano",
+        "messages": [
+            {"role": "system", "content": "You are a viral video scriptwriter. Write a high-hook English script."},
+            {"role": "user", "content": prompt}
+        ]
+    }
+    try:
+        res = requests.post("https://openrouter.ai/api/v1/chat/completions", headers=headers, json=payload, timeout=60)
+        return res.json()['choices'][0]['message']['content']
+    except:
+        return "⚠️ AI service is busy. Please try again later."
+
+# --- Handlers ---
 @dp.message(F.text == "/start")
-async def start_handler(message: types.Message):
+async def cmd_start(message: types.Message):
     uid = str(message.from_user.id)
     db = SessionLocal()
     user = db.query(User).filter(User.user_id == uid).first()
@@ -117,81 +114,72 @@ async def start_handler(message: types.Message):
         db.commit()
     db.close()
     await message.answer(
-        "👋 **Welcome to Viral AI Scriptwriter!**\n\n"
-        "I use GPT-5 Nano to create scripts for your Reels/Shorts/TikTok.\n"
-        "🎁 You have **3 free credits** to start!",
-        reply_markup=main_menu(),
-        parse_mode="Markdown"
-    )
+        f"Hi {message.from_user.first_name}! 🚀\n\nI'm your GPT-5 powered scriptwriter. "
+        f"You have **3 free credits** left.", reply_markup=main_kb(), parse_mode="Markdown")
 
 @dp.message(F.text == "👤 My Profile")
-async def profile_handler(message: types.Message):
+async def cmd_profile(message: types.Message):
     uid = str(message.from_user.id)
     db = SessionLocal()
     user = db.query(User).filter(User.user_id == uid).first()
-    text = (f"🗂 **User Profile**\n\n"
-            f"👤 Username: @{user.username or 'N/A'}\n"
-            f"🆔 ID: `{user.user_id}`\n"
-            f"💰 Balance: **{user.balance}** credits")
+    text = (f"🆔 **Your ID:** `{user.user_id}`\n"
+            f"👤 **Username:** @{user.username or 'N/A'}\n"
+            f"💰 **Balance:** {user.balance} scripts")
     db.close()
-    await message.answer(text, reply_markup=refill_button(), parse_mode="Markdown")
+    await message.answer(text, reply_markup=profile_kb(), parse_mode="Markdown")
 
 @dp.callback_query(F.data == "refill_menu")
-async def show_pricing(callback: types.CallbackQuery):
-    await callback.message.answer("Choose your credit pack:", reply_markup=pricing_menu())
+async def refill_menu(callback: types.CallbackQuery):
+    await callback.message.answer("Select a package to add credits:", reply_markup=pricing_kb())
     await callback.answer()
 
 @dp.callback_query(F.data.startswith("buy_"))
-async def handle_payment(callback: types.CallbackQuery):
+async def process_buy(callback: types.CallbackQuery):
     _, price, count = callback.data.split("_")
-    pay_url = create_payment(callback.from_user.id, price, count)
-    if pay_url:
-        await callback.message.answer(f"💳 [Click here to pay ${price} via Cryptomus]({pay_url})", parse_mode="Markdown")
+    url = create_cryptomus_invoice(callback.from_user.id, price, count)
+    if url:
+        await callback.message.answer(f"🔗 [Pay ${price} with Crypto]({url})", parse_mode="Markdown")
     else:
-        await callback.answer("Payment error. Check your API keys.", show_alert=True)
+        await callback.answer("Payment error. Try again later.")
 
 @dp.message(F.text == "🚀 Start Using")
-async def prompt_intro(message: types.Message):
-    await message.answer("Describe your video idea (e.g., 'A day in the life of a coder' or 'Healthy breakfast recipe').")
+async def cmd_use(message: types.Message):
+    await message.answer("Send me your video topic (e.g., 'Fitness tips for beginners').")
 
 @dp.message()
-async def generation_handler(message: types.Message):
+async def handle_request(message: types.Message):
     if message.text in ["👤 My Profile", "🚀 Start Using"]: return
     
-    uid = str(message.from_user.id)
     db = SessionLocal()
-    user = db.query(User).filter(User.user_id == uid).first()
+    user = db.query(User).filter(User.user_id == str(message.from_user.id)).first()
     
-    if not user or user.balance <= 0:
-        await message.answer("❌ Out of credits. Please refill in your profile.", reply_markup=refill_button())
+    if user.balance <= 0:
+        await message.answer("❌ You have 0 credits. Please refill in your profile.", reply_markup=profile_kb())
         db.close()
         return
 
-    wait_msg = await message.answer("🤖 GPT-5 Nano is writing your script...")
-    script = await call_ai_model(message.text)
+    status_msg = await message.answer("🤖 GPT-5 is writing your script...")
+    script = await fetch_ai_script(message.text)
     
     user.balance -= 1
     db.commit()
     db.close()
     
-    await wait_msg.edit_text(f"{script}\n\n📉 **Remaining balance: {user.balance}**")
+    await status_msg.edit_text(f"{script}\n\n📉 Credits left: {user.balance}")
 
-# --- Webhook Endpoint ---
+# --- Webhook ---
 @app.post("/cryptomus_webhook")
-async def cryptomus_webhook(request: Request):
+async def webhook(request: Request):
     data = await request.json()
     if data.get('status') in ['paid', 'completed']:
-        order_id = data.get('order_id')
-        try:
-            u_id, count, _ = order_id.split('_')
-            db = SessionLocal()
-            user = db.query(User).filter(User.user_id == u_id).first()
-            if user:
-                user.balance += int(count)
-                db.commit()
-                await bot.send_message(u_id, f"✅ Payment successful! {count} credits added.")
-            db.close()
-        except: pass
+        u_id, count, _ = data.get('order_id').split('_')
+        db = SessionLocal()
+        user = db.query(User).filter(User.user_id == u_id).first()
+        if user:
+            user.balance += int(count)
+            db.commit()
+            await bot.send_message(u_id, f"✅ Payment confirmed! +{count} credits added.")
+        db.close()
     return {"status": "ok"}
 
 @app.on_event("startup")
@@ -200,5 +188,4 @@ async def on_startup():
 
 if __name__ == "__main__":
     import uvicorn
-    port = int(os.getenv("PORT", 8000))
-    uvicorn.run(app, host="0.0.0.0", port=port)
+    uvicorn.run(app, host="0.0.0.0", port=int(os.getenv("PORT", 8000)))
