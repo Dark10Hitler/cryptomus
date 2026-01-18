@@ -1,15 +1,13 @@
 import os
-import hashlib
-import json
-import base64
 import asyncio
 import requests
-from fastapi import FastAPI, Request
-from sqlalchemy import create_engine, Column, Integer, String, text
+from datetime import datetime, timedelta
+from fastapi import FastAPI
+from sqlalchemy import create_engine, Column, Integer, String, DateTime, text
 from sqlalchemy.orm import declarative_base, sessionmaker
 from dotenv import load_dotenv
 from aiogram import Bot, Dispatcher, types, F
-from aiogram.types import InlineKeyboardMarkup, InlineKeyboardButton, ReplyKeyboardMarkup, KeyboardButton
+from aiogram.types import InlineKeyboardMarkup, InlineKeyboardButton
 
 load_dotenv()
 
@@ -20,9 +18,6 @@ if DATABASE_URL and DATABASE_URL.startswith("postgres://"):
 
 TG_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN")
 OPENROUTER_KEY = os.getenv("OPENROUTER_API_KEY")
-CRYPTOMUS_KEY = os.getenv("CRYPTOMUS_API_KEY")
-CRYPTOMUS_MERCHANT = os.getenv("CRYPTOMUS_MERCHANT_ID")
-RENDER_URL = os.getenv("RENDER_EXTERNAL_URL")
 
 # --- База данных ---
 engine = create_engine(DATABASE_URL, pool_pre_ping=True)
@@ -33,166 +28,166 @@ class User(Base):
     __tablename__ = "users"
     user_id = Column(String, primary_key=True)
     username = Column(String)
-    balance = Column(Integer, default=3)
+    balance = Column(Integer, default=10)
+    last_bonus = Column(DateTime, default=datetime.utcnow() - timedelta(days=1))
 
-# Создаем таблицы
 Base.metadata.create_all(bind=engine)
 
-# АВТО-ИСПРАВЛЕНИЕ: Добавляем колонку username, если её нет
+# Авто-миграция (на всякий случай)
 with engine.connect() as conn:
     try:
-        conn.execute(text("ALTER TABLE users ADD COLUMN IF NOT EXISTS username VARCHAR;"))
+        conn.execute(text("ALTER TABLE users ADD COLUMN IF NOT EXISTS last_bonus TIMESTAMP;"))
         conn.commit()
-    except Exception:
-        pass
+    except Exception: pass
 
-# --- Инициализация ---
+# --- Бот и Приложение ---
 app = FastAPI()
 bot = Bot(token=TG_TOKEN)
 dp = Dispatcher()
 
-# --- Клавиатуры ---
-def main_kb():
-    return ReplyKeyboardMarkup(keyboard=[
-        [KeyboardButton(text="👤 My Profile")],
-        [KeyboardButton(text="🚀 Start Using")]
-    ], resize_keyboard=True)
+# --- Клавиатуры (Inline под текстом) ---
+def get_main_menu():
+    buttons = [
+        [InlineKeyboardButton(text="🚀 Create New Script", callback_data="start_ai")],
+        [InlineKeyboardButton(text="👤 My Profile / Balance", callback_data="view_profile")]
+    ]
+    return InlineKeyboardMarkup(inline_keyboard=buttons)
 
-def profile_kb():
-    return InlineKeyboardMarkup(inline_keyboard=[
-        [InlineKeyboardButton(text="💳 Add Credits", callback_data="refill_menu")]
-    ])
-
-def pricing_kb():
-    return InlineKeyboardMarkup(inline_keyboard=[
-        [InlineKeyboardButton(text="💎 10 Scripts — $2", callback_data="buy_2_10")],
-        [InlineKeyboardButton(text="🔥 30 Scripts — $4", callback_data="buy_4_30")],
-        [InlineKeyboardButton(text="🚀 100 Scripts — $10", callback_data="buy_10_100")]
-    ])
-
-# --- Логика Cryptomus ---
-def create_cryptomus_invoice(user_id, amount, count):
-    order_id = f"{user_id}_{count}_{os.urandom(2).hex()}"
-    payload = {
-        "amount": str(amount),
-        "currency": "USD",
-        "order_id": order_id,
-        "url_callback": f"{RENDER_URL}/cryptomus_webhook"
-    }
-    data_json = json.dumps(payload)
-    data_base64 = base64.b64encode(data_json.encode()).decode()
-    sign = hashlib.md5((data_base64 + CRYPTOMUS_KEY).encode()).hexdigest()
-    
-    headers = {"merchant": CRYPTOMUS_MERCHANT, "sign": sign, "Content-Type": "application/json"}
-    try:
-        res = requests.post("https://api.cryptomus.com/v1/payment", headers=headers, data=data_json)
-        return res.json().get("result", {}).get("url")
-    except:
-        return None
+def get_profile_menu():
+    buttons = [
+        [InlineKeyboardButton(text="🎁 Get Daily +5 Credits", callback_data="get_bonus")],
+        [InlineKeyboardButton(text="⬅️ Back", callback_data="back_to_main")]
+    ]
+    return InlineKeyboardMarkup(inline_keyboard=buttons)
 
 # --- Логика AI ---
 async def fetch_ai_script(prompt):
     headers = {"Authorization": f"Bearer {OPENROUTER_KEY}", "Content-Type": "application/json"}
     payload = {
-        "model": "openai/gpt-5-nano",
+        "model": "openai/gpt-5-nano", # Или используй gpt-3.5-turbo для надежности
         "messages": [
-            {"role": "system", "content": "You are a viral video scriptwriter. Write a high-hook English script."},
+            {"role": "system", "content": "You are a professional viral scriptwriter. Write a structured script in English with a strong hook."},
             {"role": "user", "content": prompt}
         ]
     }
     try:
         res = requests.post("https://openrouter.ai/api/v1/chat/completions", headers=headers, json=payload, timeout=60)
         return res.json()['choices'][0]['message']['content']
-    except:
-        return "⚠️ AI service is busy. Please try again later."
+    except Exception:
+        return "⚠️ AI service is currently unavailable. Please try again in a minute."
 
-# --- Обработчики бота ---
+# --- Обработчики сообщений ---
+
 @dp.message(F.text == "/start")
 async def cmd_start(message: types.Message):
-    uid = str(message.from_user.id)
-    db = SessionLocal()
-    user = db.query(User).filter(User.user_id == uid).first()
-    if not user:
-        user = User(user_id=uid, username=message.from_user.username, balance=3)
-        db.add(user)
-        db.commit()
-    else:
-        # Обновляем юзернейм, если он изменился
-        user.username = message.from_user.username
-        db.commit()
-    db.close()
-    await message.answer(f"Hi {message.from_user.first_name}! 🚀\nI'm your AI Scriptwriter. You have 3 free credits.", reply_markup=main_kb())
-
-@dp.message(F.text == "👤 My Profile")
-async def cmd_profile(message: types.Message):
     db = SessionLocal()
     user = db.query(User).filter(User.user_id == str(message.from_user.id)).first()
+    if not user:
+        user = User(user_id=str(message.from_user.id), username=message.from_user.username, balance=10)
+        db.add(user)
+        db.commit()
     db.close()
-    if user:
-        await message.answer(f"👤 @{user.username or 'User'}\n💰 Balance: {user.balance} scripts", reply_markup=profile_kb())
+    
+    welcome_text = (
+        f"👋 **Welcome, {message.from_user.first_name}!**\n\n"
+        "I am your AI Scriptwriter. I can create viral content for your videos.\n\n"
+        "✨ **What can I do?** Just send me a topic and I'll write a script!"
+    )
+    await message.answer(welcome_text, reply_markup=get_main_menu(), parse_mode="Markdown")
 
-@dp.callback_query(F.data == "refill_menu")
-async def refill_menu(callback: types.CallbackQuery):
-    await callback.message.answer("Select a package:", reply_markup=pricing_kb())
+@dp.callback_query(F.data == "view_profile")
+async def callback_profile(callback: types.CallbackQuery):
+    db = SessionLocal()
+    user = db.query(User).filter(User.user_id == str(callback.from_user.id)).first()
+    
+    # Расчет времени до следующего бонуса
+    now = datetime.utcnow()
+    next_bonus_time = user.last_bonus + timedelta(days=1)
+    wait_time = next_bonus_time - now
+    
+    if wait_time.total_seconds() > 0:
+        hours, remainder = divmod(int(wait_time.total_seconds()), 3600)
+        minutes, _ = divmod(remainder, 60)
+        timer_text = f"⏳ Next refill in: **{hours}h {minutes}m**"
+    else:
+        timer_text = "🎁 **Daily bonus is available!**"
+
+    profile_text = (
+        "📋 **YOUR ACCOUNT INFO**\n"
+        "──────────────────\n"
+        f"👤 **User:** @{user.username or 'N/A'}\n"
+        f"🆔 **ID:** `{user.user_id}`\n"
+        f"💰 **Balance:** `{user.balance}` scripts\n"
+        "──────────────────\n"
+        f"{timer_text}"
+    )
+    db.close()
+    await callback.message.edit_text(profile_text, reply_markup=get_profile_menu(), parse_mode="Markdown")
+
+@dp.callback_query(F.data == "get_bonus")
+async def callback_bonus(callback: types.CallbackQuery):
+    db = SessionLocal()
+    user = db.query(User).filter(User.user_id == str(callback.from_user.id)).first()
+    
+    now = datetime.utcnow()
+    if now > user.last_bonus + timedelta(days=1):
+        user.balance += 5
+        user.last_bonus = now
+        db.commit()
+        await callback.answer("✅ Success! +5 credits added to your balance.", show_alert=True)
+    else:
+        await callback.answer("❌ Bonus is not available yet. Come back later!", show_alert=True)
+    
+    db.close()
+    await callback_profile(callback)
+
+@dp.callback_query(F.data == "start_ai")
+async def callback_ai_prompt(callback: types.CallbackQuery):
+    await callback.message.answer("📝 **Send me the topic of your video.**\nExample: 'How to lose weight in 30 days' or 'Top 5 crypto tips'.")
     await callback.answer()
 
-@dp.callback_query(F.data.startswith("buy_"))
-async def process_buy(callback: types.CallbackQuery):
-    _, price, count = callback.data.split("_")
-    url = create_cryptomus_invoice(callback.from_user.id, price, count)
-    if url:
-        await callback.message.answer(f"🔗 [Pay ${price} via Cryptomus]({url})", parse_mode="Markdown")
-    else:
-        await callback.answer("Payment error!")
-
-@dp.message(F.text == "🚀 Start Using")
-async def cmd_use(message: types.Message):
-    await message.answer("What is the video topic?")
+@dp.callback_query(F.data == "back_to_main")
+async def callback_main(callback: types.CallbackQuery):
+    await callback.message.edit_text("🏠 **Main Menu**\nChoose an action below:", reply_markup=get_main_menu(), parse_mode="Markdown")
 
 @dp.message()
-async def handle_request(message: types.Message):
-    if message.text in ["👤 My Profile", "🚀 Start Using"]: return
-    
+async def handle_ai_request(message: types.Message):
+    if not message.text or message.text.startswith("/"): return
+
     db = SessionLocal()
     user = db.query(User).filter(User.user_id == str(message.from_user.id)).first()
     
     if not user or user.balance <= 0:
-        await message.answer("❌ No credits left!", reply_markup=profile_kb())
+        await message.answer("❌ **Insufficient balance!**\nGet your daily bonus in the profile menu.", reply_markup=get_main_menu())
         db.close()
         return
 
-    status = await message.answer("🤖 Writing...")
-    script = await fetch_ai_script(message.text)
+    wait_msg = await message.answer("🤖 **AI is thinking...** Please wait.")
     
+    # Тратим баланс
     user.balance -= 1
     db.commit()
+    rem_balance = user.balance
     db.close()
-    await status.edit_text(f"{script}\n\n📉 Credits: {user.balance}")
 
-# --- Webhook & Startup ---
-@app.post("/cryptomus_webhook")
-async def webhook(request: Request):
-    data = await request.json()
-    if data.get('status') in ['paid', 'completed']:
-        order_id = data.get('order_id')
-        if order_id:
-            u_id, count, _ = order_id.split('_')
-            db = SessionLocal()
-            # ВОТ ЗДЕСЬ БЫЛА ОШИБКА, ТЕПЕРЬ ТУТ "=="
-            user = db.query(User).filter(User.user_id == u_id).first()
-            if user:
-                user.balance += int(count)
-                db.commit()
-                try:
-                    await bot.send_message(u_id, f"✅ Balance updated: +{count}")
-                except: pass
-            db.close()
-    return {"status": "ok"}
+    script = await fetch_ai_script(message.text)
+    
+    final_text = (
+        f"🎬 **YOUR SCRIPT:**\n\n{script}\n\n"
+        "──────────────────\n"
+        f"💰 **Balance left:** `{rem_balance}`"
+    )
+    await wait_msg.edit_text(final_text, reply_markup=get_main_menu(), parse_mode="Markdown")
 
+# --- Запуск ---
 @app.on_event("startup")
 async def on_startup():
     await bot.delete_webhook(drop_pending_updates=True)
     asyncio.create_task(dp.start_polling(bot))
+
+@app.get("/")
+async def root():
+    return {"status": "Bot is running"}
 
 if __name__ == "__main__":
     import uvicorn
