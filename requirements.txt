@@ -1,8 +1,7 @@
+aiogram
 fastapi
 uvicorn
-aiogram
 sqlalchemy
 psycopg2-binary
 requests
 python-dotenv
-pydantic
